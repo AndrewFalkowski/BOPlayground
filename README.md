@@ -3,7 +3,13 @@
 A small BoTorch playground for teaching the basic Bayesian optimization loop.
 
 This project uses [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-for Python environment management. To start a similar project from scratch, run:
+for Python environment management. To generate the environment, run:
+
+```bash
+uv sync
+```
+
+To start a similar project from scratch, run:
 
 ```bash
 uv init
