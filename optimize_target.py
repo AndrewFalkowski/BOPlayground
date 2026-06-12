@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import torch
 from botorch.acquisition import LogExpectedImprovement
@@ -113,8 +115,11 @@ def main() -> None:
     ax.set_ylabel("objective value")
     ax.legend()
     fig.tight_layout()
-    fig.savefig("trace_plot.png", dpi=150)
-    print("\nSaved trace plot to trace_plot.png")
+    figures_dir = Path("figures")
+    figures_dir.mkdir(exist_ok=True)
+    plot_path = figures_dir / "trace_plot.png"
+    fig.savefig(plot_path, dpi=150)
+    print(f"\nSaved trace plot to {plot_path}")
 
 
 if __name__ == "__main__":

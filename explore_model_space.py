@@ -1,19 +1,24 @@
 import argparse
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import matplotlib.pyplot as plt
 import torch
-from botorch.acquisition.active_learning import qNegIntegratedPosteriorVariance
-from botorch.fit import fit_gpytorch_mll
+from botorch.fit import fit_fully_bayesian_model_nuts
 from botorch.generation.gen import gen_candidates_torch
-from botorch.models import SingleTaskGP
+from botorch.models.fully_bayesian import FullyBayesianSingleTaskGP
 from botorch.models.transforms import Normalize, Standardize
 from botorch.optim import optimize_acqf
+from botorch.sampling.normal import SobolQMCNormalSampler
 from botorch.test_functions.synthetic import Branin
 from botorch.utils.sampling import draw_sobol_samples
 from botorch.utils.transforms import normalize, unnormalize
-from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch_community.acquisition.bayesian_active_learning import (
+    qHyperparameterInformedPredictiveExploration,
+)
 
 torch.manual_seed(42)
 torch.set_default_dtype(torch.double)
@@ -27,10 +32,15 @@ class RunConfig:
     batch_size: int
     n_rmse_points: int
     n_integration_points: int
+    nuts_samples: int
+    nuts_warmup: int
+    nuts_thinning: int
     num_restarts: int
     raw_samples: int
     acq_opt_steps: int
     acq_opt_lr: float
+    mc_samples: int
+    beta_tuning_samples: int
     acq_batch_limit: int
     init_batch_limit: int
 
@@ -42,10 +52,15 @@ SMOKE_CONFIG = RunConfig(
     batch_size=2,
     n_rmse_points=64,
     n_integration_points=32,
+    nuts_samples=32,
+    nuts_warmup=32,
+    nuts_thinning=1,
     num_restarts=2,
     raw_samples=32,
     acq_opt_steps=20,
     acq_opt_lr=0.05,
+    mc_samples=16,
+    beta_tuning_samples=8,
     acq_batch_limit=1,
     init_batch_limit=8,
 )
@@ -56,11 +71,16 @@ PRODUCTION_CONFIG = RunConfig(
     n_batches=15,
     batch_size=3,
     n_rmse_points=512,
-    n_integration_points=128,
+    n_integration_points=256,
+    nuts_samples=128,
+    nuts_warmup=512,
+    nuts_thinning=4,
     num_restarts=4,
     raw_samples=64,
     acq_opt_steps=80,
     acq_opt_lr=0.03,
+    mc_samples=64,
+    beta_tuning_samples=32,
     acq_batch_limit=1,
     init_batch_limit=4,
 )
@@ -68,7 +88,7 @@ PRODUCTION_CONFIG = RunConfig(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Explore Branin with NIPV and a standard GP."
+        description="Explore Branin with HIPE and a fully Bayesian GP."
     )
     parser.add_argument(
         "--smoke",
@@ -78,11 +98,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_model(train_x: torch.Tensor, train_y: torch.Tensor, dim: int) -> SingleTaskGP:
-    return SingleTaskGP(
+def build_model(
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    unit_bounds: torch.Tensor,
+    dim: int,
+) -> FullyBayesianSingleTaskGP:
+    return FullyBayesianSingleTaskGP(
         train_X=train_x,
         train_Y=train_y,
-        input_transform=Normalize(d=dim),
+        input_transform=Normalize(d=dim, bounds=unit_bounds),
         outcome_transform=Standardize(m=1),
     )
 
@@ -104,13 +129,13 @@ def main() -> None:
     train_y = problem(train_x_native).unsqueeze(-1)
 
     # Fixed points used only to measure how well the model has learned the surface.
-    rmse_x = draw_sobol_samples(bounds=unit_bounds, n=config.n_rmse_points, q=1).squeeze(
-        1
-    )
+    rmse_x = draw_sobol_samples(
+        bounds=unit_bounds, n=config.n_rmse_points, q=1
+    ).squeeze(1)
     rmse_x_native = unnormalize(rmse_x, bounds=native_bounds)
     rmse_y_true = problem(rmse_x_native).unsqueeze(-1)
 
-    # Points used by NIPV to measure average posterior uncertainty over the space.
+    # Points used by HIPE to measure predictive information over the space.
     integration_x = draw_sobol_samples(
         bounds=unit_bounds,
         n=config.n_integration_points,
@@ -118,30 +143,48 @@ def main() -> None:
     ).squeeze(1)
 
     print(
-        f"Exploring {problem.__class__.__name__} with NIPV "
+        f"Exploring {problem.__class__.__name__} with HIPE "
         f"using {config.name} settings in batches of {config.batch_size}"
     )
 
     rmse_trace = []
 
     for batch in range(1, config.n_batches + 1):
-        model = build_model(train_x, train_y, problem.dim)
+        model = build_model(train_x, train_y, unit_bounds, problem.dim)
 
-        # fit model
-        fit_gpytorch_mll(ExactMarginalLogLikelihood(model.likelihood, model))
+        # fit model by sampling the GP hyperparameter posterior with NUTS
+        fit_fully_bayesian_model_nuts(
+            model,
+            num_samples=config.nuts_samples,
+            warmup_steps=config.nuts_warmup,
+            thinning=config.nuts_thinning,
+            disable_progbar=True,
+        )
 
         # measure how close the model's mean prediction is to the true function
         posterior = model.posterior(rmse_x)
-        rmse = torch.sqrt(torch.mean((posterior.mean - rmse_y_true) ** 2)).item()
+        rmse = torch.sqrt(
+            torch.mean((posterior.mixture_mean - rmse_y_true) ** 2)
+        ).item()
         rmse_trace.append(rmse)
 
-        # specify exploration acquisition function
-        acquisition = qNegIntegratedPosteriorVariance(
+        # specify HIPE acquisition function
+        acquisition = qHyperparameterInformedPredictiveExploration(
             model=model,
             mc_points=integration_x,
+            bounds=unit_bounds,
+            sampler=SobolQMCNormalSampler(
+                sample_shape=torch.Size([config.mc_samples]),
+                seed=42 + batch,
+            ),
+            beta_tuning_samples=config.beta_tuning_samples,
         )
 
         # optimize acqf to get the next batch of selected candidate points
+        #
+        # HIPE conditions one fully Bayesian model per candidate batch, so
+        # evaluating many raw samples or restarts in parallel can allocate very
+        # large dense covariance tensors. Keep those batches explicitly bounded.
         candidates, _ = optimize_acqf(
             acq_function=acquisition,
             bounds=unit_bounds,
@@ -172,10 +215,16 @@ def main() -> None:
         )
 
     # Fit once more after the final batch so the final RMSE includes all points.
-    model = build_model(train_x, train_y, problem.dim)
-    fit_gpytorch_mll(ExactMarginalLogLikelihood(model.likelihood, model))
+    model = build_model(train_x, train_y, unit_bounds, problem.dim)
+    fit_fully_bayesian_model_nuts(
+        model,
+        num_samples=config.nuts_samples,
+        warmup_steps=config.nuts_warmup,
+        thinning=config.nuts_thinning,
+        disable_progbar=True,
+    )
     posterior = model.posterior(rmse_x)
-    rmse = torch.sqrt(torch.mean((posterior.mean - rmse_y_true) ** 2)).item()
+    rmse = torch.sqrt(torch.mean((posterior.mixture_mean - rmse_y_true) ** 2)).item()
     rmse_trace.append(rmse)
 
     print("\nResult")
@@ -183,8 +232,7 @@ def main() -> None:
     print(f"number of observations: {len(train_y)}")
 
     rmse_steps = [
-        config.n_initial_points + i * config.batch_size
-        for i in range(len(rmse_trace))
+        config.n_initial_points + i * config.batch_size for i in range(len(rmse_trace))
     ]
 
     fig, axs = plt.subplots(ncols=2, figsize=(8, 4))
@@ -204,7 +252,7 @@ def main() -> None:
         train_x[config.n_initial_points :, 0],
         train_x[config.n_initial_points :, 1],
         color="black",
-        label="NIPV exploration",
+        label="HIPE exploration",
     )
     axs[1].set_xlabel("x1 normalized")
     axs[1].set_ylabel("x2 normalized")
@@ -213,7 +261,7 @@ def main() -> None:
     fig.tight_layout()
     figures_dir = Path("figures")
     figures_dir.mkdir(exist_ok=True)
-    plot_path = figures_dir / "error_reduction.png"
+    plot_path = figures_dir / "model_space_error_reduction.png"
     fig.savefig(plot_path, dpi=150)
     print(f"\nSaved exploration plot to {plot_path}")
 

@@ -1,10 +1,10 @@
 [project]
 name = "boplayground"
 version = "0.1.0"
-description = "Add your description here"
+description = "A small BoTorch playground for Bayesian optimization examples"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "botorch>=0.18.1",
+    "botorch[fully-bayesian]>=0.18.1",
     "matplotlib>=3.10.9",
 ]
